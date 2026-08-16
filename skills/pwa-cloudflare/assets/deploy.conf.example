@@ -1,0 +1,11 @@
+# Per-app settings for deploy.sh. Every value is optional.
+WORKER_DIR=worker                                  # auto-detected if omitted
+STAMP_FILES="frontend/js/config.js frontend/sw.js" # files containing a VERSION placeholder
+VERIFY_URL=https://APP.SUBDOMAIN.workers.dev       # polled until the new build is live
+VERIFY_PATH=/js/config.js                          # a file whose body contains the version
+GIT_COMMIT=1                                       # 1 to commit+push the stamp after deploying
+
+# Browser-side halves of npm packages, copied from node_modules into the assets
+# dir on each deploy (a browser cannot resolve a bare specifier without a
+# bundler). Format: <src>:<dest>, space separated.
+VENDOR_COPY="worker/node_modules/PKG/src/client.js:frontend/js/vendor/PKG/client.js"

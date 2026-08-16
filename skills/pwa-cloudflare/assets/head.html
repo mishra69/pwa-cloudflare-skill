@@ -1,0 +1,23 @@
+<!-- PWA <head> block. Replace APP_NAME and the two theme colours.
+     Order doesn't matter; presence does. -->
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+
+<!-- mobile-web-app-capable is the standard spelling; the apple- one is
+     deprecated but still read by older iOS. Ship both. -->
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+
+<!-- "default" keeps iOS from drawing the web view under the status bar.
+     Use black-translucent ONLY if every screen honours env(safe-area-inset-top).
+     iOS bakes this value in at install time — changing it later does NOT
+     affect an already-installed app. See SKILL.md. -->
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="APP_NAME" />
+
+<meta name="theme-color" content="#f0f4f8" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#111827" media="(prefers-color-scheme: dark)" />
+
+<link rel="manifest" href="/manifest.json" />
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+<link rel="icon" href="/icons/icon-192.png" type="image/png" />

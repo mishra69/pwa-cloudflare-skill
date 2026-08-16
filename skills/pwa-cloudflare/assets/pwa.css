@@ -1,0 +1,46 @@
+/*! skill-asset: pwa.css v1.0.0 (canonical: skills/pwa-cloudflare/assets/pwa.css) */
+/* Mobile/standalone fixes every PWA needs. Merge into the app's stylesheet. */
+
+html, body {
+  /* iOS rubber-band scrolling reads as broken in a standalone app, where
+     there's no browser chrome for the page to snap back against. */
+  overscroll-behavior: none;
+}
+
+/* Suppress the 300ms double-tap-to-zoom delay so rapid taps register as taps.
+   Apply to every interactive element, not just buttons. */
+button, .btn, [role="button"], input, select, a {
+  touch-action: manipulation;
+}
+
+/* Any full-screen container must honour the safe area, or content slides under
+   the notch and home indicator. WATCH FOR: a more specific rule later in the
+   file setting `padding: 0` on one screen — that silently wipes this. */
+.screen {
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+           env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+
+/* A fixed top bar should absorb the top inset ITSELF rather than being pushed
+   down by a parent, so its background fills behind the status bar instead of
+   leaving a gap. Grow the height, pad the contents down. */
+.app-topbar {
+  padding-top: env(safe-area-inset-top);
+  height: calc(var(--topbar-height, 56px) + env(safe-area-inset-top));
+}
+
+/* Size viewport-filling elements with dvh, not vh — vh doesn't track the real
+   viewport in standalone mode. Subtract the insets you didn't already consume. */
+.fills-viewport {
+  height: calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+}
+
+/* Build stamp, set from CONFIG.VERSION by the app. */
+.version-tag {
+  margin-top: 16px;
+  text-align: center;
+  font-size: 11px;
+  letter-spacing: 0.4px;
+  opacity: 0.55;
+  font-variant-numeric: tabular-nums;
+}
