@@ -270,6 +270,7 @@ Depend on [`webpush-edge`](https://github.com/mishra69/webpush-edge) — zero-de
 - **The VAPID public key endpoint must be unauthenticated.** It's public by definition; gating it means the browser can't subscribe at all.
 - **Bearer-token apps need `subscribe({ headers })`** (v1.1.0+). Without it the client issues bare fetches and your own endpoints answer 401.
 - **Storage**: `kvStore(env.KV)`, or any `{ get(id), set(id, subs) }` — a D1 table works fine. The store receives the *whole list* on every change, so a naive "delete all then reinsert" resets `created_at` and defeats upserts.
+- **Re-send the browser's subscription on every app open.** The browser can hold a live subscription the server never stored (made under another account, pruned, a lost POST, a wiped store). The page then shows "Turn on" while permission is already granted, and the test trigger answers "no devices". When `Notification.permission === "granted"` and `currentSubscription()` returns one the server doesn't list, call `subscribe({ prompt: false })`; it's idempotent on endpoint and needs no gesture.
 - **Ship a hidden test trigger.** Tapping the build stamp to subscribe and fire a one-off push turns "notifications don't work" into a status code: 201 accepted, 403 VAPID mismatch, 400 encryption, 410 subscription gone.
 
 ## Google sign-in (if the app needs accounts)
