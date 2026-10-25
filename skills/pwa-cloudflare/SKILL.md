@@ -1,7 +1,7 @@
 ---
 name: pwa-cloudflare
-version: 1.0.0
-description: Turn a web app into an installable PWA served from a single Cloudflare Worker — manifest, icons, offline service worker, iOS/Safari install prompt, versioned deploys. Use when adding PWA/offline/"add to home screen" support, scaffolding a new PWA, consolidating a Pages + Worker split into one Worker, or debugging stale caches, install prompts, or iOS status-bar/safe-area problems.
+version: 1.1.0
+description: Turn a web app into an installable PWA served from a single Cloudflare Worker — manifest, icons, offline service worker, iOS/Safari install prompt, versioned deploys, Web Push and scheduling notifications at a local time of day. Use when adding PWA/offline/"add to home screen" support or time-of-day push reminders, scaffolding a new PWA, consolidating a Pages + Worker split into one Worker, or debugging stale caches, install prompts, or iOS status-bar/safe-area problems.
 ---
 
 # PWA on Cloudflare Workers
@@ -58,6 +58,14 @@ Two paths. Decide first, then follow Part 2.
 - Use `webpush-edge` — don't hand-roll the encryption or VAPID signing
 - A service worker `push` handler is required; Declarative Web Push alone doesn't display on iOS
 - Handle `pushsubscriptionchange`, or subscriptions silently die and notifications just stop
+
+## Scheduling notifications ("at 9 pm their time")
+- **Don't poll with a cron.** One Durable Object per user, with its alarm set for that user's next send
+- **Decide at fire time** against fresh data, not when the alarm is armed
+- **Re-plan on events** (a subscription re-sent on app open carries the device's zone, so travel re-plans itself), plus a **daily** cron as a safety net
+- **Write the "sent" row before sending**, so a retried alarm can't double-send
+- **Local time to an instant has to survive DST** and half-hour zones; test both
+- The free plan only has **SQLite-backed** Durable Objects (`new_sqlite_classes`)
 
 ## Deploying
 - Version stamp drives the service worker cache name, so every deploy busts the cache automatically
@@ -272,6 +280,64 @@ Depend on [`webpush-edge`](https://github.com/mishra69/webpush-edge) — zero-de
 - **Storage**: `kvStore(env.KV)`, or any `{ get(id), set(id, subs) }` — a D1 table works fine. The store receives the *whole list* on every change, so a naive "delete all then reinsert" resets `created_at` and defeats upserts.
 - **Re-send the browser's subscription on every app open.** The browser can hold a live subscription the server never stored (made under another account, pruned, a lost POST, a wiped store). The page then shows "Turn on" while permission is already granted, and the test trigger answers "no devices". When `Notification.permission === "granted"` and `currentSubscription()` returns one the server doesn't list, call `subscribe({ prompt: false })`; it's idempotent on endpoint and needs no gesture.
 - **Ship a hidden test trigger.** Tapping the build stamp to subscribe and fire a one-off push turns "notifications don't work" into a status code: 201 accepted, 403 VAPID mismatch, 400 encryption, 410 subscription gone.
+
+## Scheduling sends (if notifications go out at a time of day)
+
+"Remind them at 21:00 their time" has an obvious implementation: a cron every few minutes that asks every user "is it 21:00 for you yet?". Don't. A cron fires only on its own ticks, so it either quantises every send to :00/:30 or runs constantly. A per-minute cron was measured at ~85% of an app's D1 queries, nearly all finding nothing to do. **Use a Durable Object alarm per user instead.** It fires at the exact minute, costs nothing between sends, and there is no sweep to keep cheap.
+
+```toml
+[[durable_objects.bindings]]
+name = "CLOCK"
+class_name = "UserClock"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["UserClock"]   # the free plan only offers SQLite-backed objects
+```
+
+```js
+import { DurableObject } from 'cloudflare:workers';
+
+// One per user (idFromName(userId)). A DO holds a single alarm: set it for the next thing due.
+export class UserClock extends DurableObject {
+  async wake(userId) {                       // RPC from the Worker
+    await this.ctx.storage.put('userId', userId);
+    await this.plan(userId);
+  }
+  async alarm() {
+    const userId = await this.ctx.storage.get('userId');
+    try {
+      await sendDue(this.env, userId, Date.now());   // decides now, from D1; claims before sending
+    } finally {
+      await this.plan(userId);                       // whatever happened, the chain continues
+    }
+  }
+  async plan(userId) {
+    const next = await nextDue(this.env, userId, Date.now());   // re-derived from D1 every time
+    if (next == null) await this.ctx.storage.deleteAlarm();
+    else await this.ctx.storage.setAlarm(Math.max(next, Date.now()));  // past = fire now
+  }
+}
+
+export const wake = (env, userId) => env.CLOCK.get(env.CLOCK.idFromName(userId)).wake(userId);
+```
+
+- **Keep `sendDue` and `nextDue` pure** (an injected `now`, zone and state; no I/O). Unit tests can then cover any hour, DST weekend or flight without waiting for 21:00. Keep them in modules that don't import the DO file: `cloudflare:workers` doesn't resolve under Node, and one transitive import fails the whole test file.
+- **`nextDue` must return `now` when something is due now.** The obvious "first time strictly after now" skips the send that's due *right now*. That's exactly the case of a user subscribing at 21:10, when the alarm should fire at once. Add a property test: for many values of `now`, the time it returns is one at which `sendDue` would actually send.
+- **Decide at fire time, not at plan time.** An armed alarm is a *prediction* that a send will be wanted. The real answer (cap reached, already logged today, quiet day or not) only exists when it fires. Checking then has no race. A sweep that disarms alarms races the alarm it's trying to cancel.
+- **Claim before sending.** Insert the `(user, kind, local_date)` row with `INSERT OR IGNORE` first, and send only if it inserted. Alarms are retried on failure, and a retry must not double-send.
+- **Wake the clock on events, not on a schedule:**
+  - on anything that changes what's due next;
+  - on every push subscription. The page already re-sends it on each app open (see above), so send the device's IANA zone with it (`X-Timezone: Intl.DateTimeFormat().resolvedOptions().timeZone`). Travel then re-plans the next send by itself.
+  - The alarm itself doesn't need waking for data that only makes a send *unnecessary*: the fire-time check covers that.
+- **Keep one daily cron as a safety net** that calls `wake()` for every subscribed user, in case an alarm was lost to a bad deploy or migration. Alarms are durable and retried, so this is insurance, not the delivery path.
+- **Local time to instant, DST-safe.** Guess the UTC instant from the wall-clock fields, read the zone's wall clock back at the guess with `Intl.DateTimeFormat(…, { timeZone })`, and correct by the difference. Two corrections settle across any transition. Test a fall-back night and a `+05:30` zone.
+- **Guard sane hours after travel.** An alarm armed for 21:00 Pacific fires at about 04:00 for someone who has just landed in India. Re-check the local hour at fire time and drop the send if it's outside, say, 07:00–24:00. Or re-plan on the next app open, which the subscription re-send already does.
+- **Two ways to plan, both fine:**
+  - **Plan ahead:** choose the target hours early (e.g. at a 04:00 rollover), with random jitter so the notification doesn't become a cue of its own. Store it, and keep a frequent safety-net cron for the planning step.
+  - **Re-derive:** every wake computes the next send from the data, with no stored plan, so it can't drift. Only a daily safety net is needed.
+- **The same clock can run other per-user work** that has to happen later, such as a queued background job with retry backoff. Make `nextDue` the earliest of everything the user is waiting for. There's still one alarm per user, and nothing polls.
+- **Local testing:** `wrangler dev` and the Cloudflare Vite plugin run alarms for real, so an end-to-end test can subscribe and poll for the "sent" row instead of faking the clock.
 
 ## Google sign-in (if the app needs accounts)
 
