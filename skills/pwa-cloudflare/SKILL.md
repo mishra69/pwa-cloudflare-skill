@@ -283,7 +283,7 @@ Depend on [`webpush-edge`](https://github.com/mishra69/webpush-edge) — zero-de
 
 ## Scheduling sends (if notifications go out at a time of day)
 
-"Remind them at 21:00 their time" has an obvious implementation: a cron every few minutes that asks every user "is it 21:00 for you yet?". Don't. A cron fires only on its own ticks, so it either quantises every send to :00/:30 or runs constantly. A per-minute cron was measured at ~85% of an app's D1 queries, nearly all finding nothing to do. **Use a Durable Object alarm per user instead.** It fires at the exact minute, costs nothing between sends, and there is no sweep to keep cheap.
+**Use a Durable Object alarm per user, not a polling cron.** A cron fires only on its ticks, so it either quantises sends to :00/:30 or runs constantly to find nothing due. An alarm fires at the exact minute and costs nothing in between.
 
 ```toml
 [[durable_objects.bindings]]
@@ -298,46 +298,37 @@ new_sqlite_classes = ["UserClock"]   # the free plan only offers SQLite-backed o
 ```js
 import { DurableObject } from 'cloudflare:workers';
 
-// One per user (idFromName(userId)). A DO holds a single alarm: set it for the next thing due.
-export class UserClock extends DurableObject {
-  async wake(userId) {                       // RPC from the Worker
+export class UserClock extends DurableObject {        // one per user: idFromName(userId)
+  async wake(userId) {
     await this.ctx.storage.put('userId', userId);
     await this.plan(userId);
   }
   async alarm() {
     const userId = await this.ctx.storage.get('userId');
-    try {
-      await sendDue(this.env, userId, Date.now());   // decides now, from D1; claims before sending
-    } finally {
-      await this.plan(userId);                       // whatever happened, the chain continues
-    }
+    try { await sendDue(this.env, userId, Date.now()); }
+    finally { await this.plan(userId); }               // the chain survives a failed send
   }
   async plan(userId) {
-    const next = await nextDue(this.env, userId, Date.now());   // re-derived from D1 every time
+    const next = await nextDue(this.env, userId, Date.now());
     if (next == null) await this.ctx.storage.deleteAlarm();
-    else await this.ctx.storage.setAlarm(Math.max(next, Date.now()));  // past = fire now
+    else await this.ctx.storage.setAlarm(Math.max(next, Date.now()));
   }
 }
 
 export const wake = (env, userId) => env.CLOCK.get(env.CLOCK.idFromName(userId)).wake(userId);
 ```
 
-- **Keep `sendDue` and `nextDue` pure** (an injected `now`, zone and state; no I/O). Unit tests can then cover any hour, DST weekend or flight without waiting for 21:00. Keep them in modules that don't import the DO file: `cloudflare:workers` doesn't resolve under Node, and one transitive import fails the whole test file.
-- **`nextDue` must return `now` when something is due now.** The obvious "first time strictly after now" skips the send that's due *right now*. That's exactly the case of a user subscribing at 21:10, when the alarm should fire at once. Add a property test: for many values of `now`, the time it returns is one at which `sendDue` would actually send.
-- **Decide at fire time, not at plan time.** An armed alarm is a *prediction* that a send will be wanted. The real answer (cap reached, already logged today, quiet day or not) only exists when it fires. Checking then has no race. A sweep that disarms alarms races the alarm it's trying to cancel.
-- **Claim before sending.** Insert the `(user, kind, local_date)` row with `INSERT OR IGNORE` first, and send only if it inserted. Alarms are retried on failure, and a retry must not double-send.
-- **Wake the clock on events, not on a schedule:**
-  - on anything that changes what's due next;
-  - on every push subscription. The page already re-sends it on each app open (see above), so send the device's IANA zone with it (`X-Timezone: Intl.DateTimeFormat().resolvedOptions().timeZone`). Travel then re-plans the next send by itself.
-  - The alarm itself doesn't need waking for data that only makes a send *unnecessary*: the fire-time check covers that.
-- **Keep one daily cron as a safety net** that calls `wake()` for every subscribed user, in case an alarm was lost to a bad deploy or migration. Alarms are durable and retried, so this is insurance, not the delivery path.
-- **Local time to instant, DST-safe.** Guess the UTC instant from the wall-clock fields, read the zone's wall clock back at the guess with `Intl.DateTimeFormat(…, { timeZone })`, and correct by the difference. Two corrections settle across any transition. Test a fall-back night and a `+05:30` zone.
-- **Guard sane hours after travel.** An alarm armed for 21:00 Pacific fires at about 04:00 for someone who has just landed in India. Re-check the local hour at fire time and drop the send if it's outside, say, 07:00–24:00. Or re-plan on the next app open, which the subscription re-send already does.
-- **Two ways to plan, both fine:**
-  - **Plan ahead:** choose the target hours early (e.g. at a 04:00 rollover), with random jitter so the notification doesn't become a cue of its own. Store it, and keep a frequent safety-net cron for the planning step.
-  - **Re-derive:** every wake computes the next send from the data, with no stored plan, so it can't drift. Only a daily safety net is needed.
-- **The same clock can run other per-user work** that has to happen later, such as a queued background job with retry backoff. Make `nextDue` the earliest of everything the user is waiting for. There's still one alarm per user, and nothing polls.
-- **Local testing:** `wrangler dev` and the Cloudflare Vite plugin run alarms for real, so an end-to-end test can subscribe and poll for the "sent" row instead of faking the clock.
+- **Decide at fire time.** An armed alarm is a prediction; check the current data (cap, already sent, still wanted) when it fires. Don't cancel alarms with a sweep: it races the alarm.
+- **Claim before sending:** `INSERT OR IGNORE` a `(user, kind, local_date)` row and send only if it inserted. Alarms retry on failure.
+- **`nextDue` returns `now` if something is due now**, not the first time strictly after it. Property-test it: for any `now`, the time it returns is one at which `sendDue` sends.
+- **Keep `sendDue`/`nextDue` logic pure** (injected `now`, zone, state) and out of modules that import the DO file: `cloudflare:workers` doesn't resolve under Node, so the import breaks unit tests.
+- **Wake on events:** whatever changes what's due next, and every push subscription. The page re-sends it on each open (above); include the device zone (`X-Timezone: Intl.DateTimeFormat().resolvedOptions().timeZone`) so travel re-plans itself.
+- **Keep one daily cron as a safety net** that wakes every subscribed user's clock.
+- **Local time → instant, DST-safe:** guess from the wall-clock fields, read the zone's wall clock at the guess via `Intl.DateTimeFormat({ timeZone })`, correct by the difference, twice. Test a fall-back night and a `+05:30` zone.
+- **Guard sane hours at fire time** (e.g. 07:00–24:00 local). An alarm planned in one zone fires at 04:00 after a flight.
+- **Plan ahead or re-derive.** To add jitter, draw the target hours early and store it. Otherwise compute the next send from the data on every wake, which can't drift.
+- **One alarm can serve all of a user's deferred work** (e.g. a job queue with backoff): `nextDue` is the earliest of everything pending.
+- **`wrangler dev` and the Cloudflare Vite plugin run alarms for real**, so end-to-end tests can poll for the "sent" row.
 
 ## Google sign-in (if the app needs accounts)
 
